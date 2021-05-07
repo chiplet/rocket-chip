@@ -19,6 +19,17 @@ import chisel3.internal.sourceinfo.SourceInfo
 case object PgLevels extends Field[Int](2)
 case object ASIdBits extends Field[Int](0)
 
+/**
+  * rs1 rs2
+  *  0   0 -> flush All
+  *  0   1 -> flush by ASID
+  *  1   1 -> flush by ADDR
+  *  1   0 -> flush by ADDR and ASID
+  * If rs1=x0 and rs2=x0, the fence orders all reads and writes made to any level of the page tables, for all address spaces.
+  * If rs1=x0 and rs2̸!=x0, the fence orders all reads and writes made to any level of the page tables, but only for the address space identified by integer register rs2. Accesses to global mappings (see Section 4.3.1) are not ordered.
+  * If rs1̸!=x0 and rs2=x0, the fence orders only reads and writes made to the leaf page table entry corresponding to the virtual address in rs1, for all address spaces.
+  * If rs1̸!=x0 and rs2̸!=x0, the fence orders only reads and writes made to the leaf page table entry corresponding to the virtual address in rs1, for the address space identified by integer register rs2. Accesses to global mappings are not ordered.
+  */
 class SFenceReq(implicit p: Parameters) extends CoreBundle()(p) {
   val rs1 = Bool()
   val rs2 = Bool()
@@ -27,9 +38,13 @@ class SFenceReq(implicit p: Parameters) extends CoreBundle()(p) {
 }
 
 class TLBReq(lgMaxSize: Int)(implicit p: Parameters) extends CoreBundle()(p) {
+  /** request address from CPU. */
   val vaddr = UInt(width = vaddrBitsExtended)
+  /** don't lookup TLB, bypass vaddr as paddr. */
   val passthrough = Bool()
+  /** @todo seems granularity */
   val size = UInt(width = log2Ceil(lgMaxSize + 1))
+  /** memory command. */
   val cmd  = Bits(width = M_SZ)
 
   override def cloneType = new TLBReq(lgMaxSize).asInstanceOf[this.type]
@@ -43,27 +58,49 @@ class TLBExceptions extends Bundle {
 
 class TLBResp(implicit p: Parameters) extends CoreBundle()(p) {
   // lookup responses
+  /** @todo */
   val miss = Bool()
+  /** physical address. */
   val paddr = UInt(width = paddrBits)
+  /** page fault exception. */
   val pf = new TLBExceptions
+  /** access exception. */
   val ae = new TLBExceptions
+  /** misaligned access exception. */
   val ma = new TLBExceptions
+  /** @todo */
   val cacheable = Bool()
+  /** @todo */
   val must_alloc = Bool()
+  /** @todo */
   val prefetchable = Bool()
 }
 
 class TLBEntryData(implicit p: Parameters) extends CoreBundle()(p) {
   val ppn = UInt(width = ppnBits)
+  /** pte.u user */
   val u = Bool()
+  /** pte.g global */
   val g = Bool()
+
+  /** access exception.
+    * @todo WTF ae here?
+    */
   val ae = Bool()
+
+  /** supervisor write */
   val sw = Bool()
+  /** supervisor execute */
   val sx = Bool()
+  /** supervisor read */
   val sr = Bool()
+  /** prot_w */
   val pw = Bool()
+  /** prot_x */
   val px = Bool()
+  /** prot_r */
   val pr = Bool()
+
   val ppp = Bool() // PutPartial
   val pal = Bool() // AMO logical
   val paa = Bool() // AMO arithmetic
@@ -149,25 +186,62 @@ case class TLBConfig(
     nSectors: Int = 4,
     nSuperpageEntries: Int = 4)
 
+/** MMU Block which can be used as PMA & TLB
+  * @todo PMA -> consume diplomacy parameter generate physical memory address checking logic.
+  * Boom use Rocket ITLB, and its own DTLB.
+  * Accelerators:
+  *   sha3: DTLB
+  *   gemmini: DTLB
+  *   hwacha: DTLB*2+ITLB
+  *
+  * @param instruction true for ITLB, false for DTLB
+  * @param lgMaxSize @todo seems granularity
+  * @param cfg [[TLBConfig]]
+  * @param edge collect SoC metadata.
+  */
 class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(p) {
   val io = new Bundle {
+    /** request from CPU. */
     val req = Decoupled(new TLBReq(lgMaxSize)).flip
+    /** response to CPU. */
     val resp = new TLBResp().asOutput
+    /** SFence Input. */
     val sfence = Valid(new SFenceReq).asInput
+    /** IO to PTW. */
     val ptw = new TLBPTWIO
-    val kill = Bool(INPUT) // suppress a TLB refill, one cycle after a miss
+    /** suppress a TLB refill, one cycle after a miss. */
+    val kill = Bool(INPUT)
   }
 
+  /** @todo WTF pmpGranularity? seems a bug here. */
   val pageGranularityPMPs = pmpGranularity >= (1 << pgIdxBits)
+  /** virtual memory. */
   val vpn = io.req.bits.vaddr(vaddrBits-1, pgIdxBits)
   val memIdx = vpn.extract(cfg.nSectors.log2 + cfg.nSets.log2 - 1, cfg.nSectors.log2)
+
+  /** TLB Entry */
   val sectored_entries = Reg(Vec(cfg.nSets, Vec(cfg.nWays / cfg.nSectors, new TLBEntry(cfg.nSectors, false, false))))
+  /** Superpage Entry */
   val superpage_entries = Reg(Vec(cfg.nSuperpageEntries, new TLBEntry(1, true, true)))
+  /** Special Entry
+    * If PMP granularity is less than page size, thus need additional "special" entry manage PMP.
+    */
   val special_entry = (!pageGranularityPMPs).option(Reg(new TLBEntry(1, true, false)))
+
+  /** @todo */
   def ordinary_entries = sectored_entries(memIdx) ++ superpage_entries
+  /** @todo */
   def all_entries = ordinary_entries ++ special_entry
+  /** @todo */
   def all_real_entries = sectored_entries.flatten ++ superpage_entries ++ special_entry
 
+  /** State Machine
+    * s_ready: ready to accept request from CPU.
+    * s_request: send request to PTW(L2TLB), when L1TLB(this) miss.
+    * s_wait: wait for PTW to refill L1TLB.
+    * s_wait_invalidate: L1TLB is waiting for respond from PTW, but L1TLB might flush respond from PTW.
+    *
+    */
   val s_ready :: s_request :: s_wait :: s_wait_invalidate :: Nil = Enum(UInt(), 4)
   val state = Reg(init=s_ready)
   val r_refill_tag = Reg(UInt(width = vpnBits))
@@ -176,6 +250,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val r_sectored_hit_addr = Reg(UInt(log2Ceil(sectored_entries(0).size).W))
   val r_sectored_hit = Reg(Bool())
 
+  /** privilege mode */
   val priv = if (instruction) io.ptw.status.prv else io.ptw.status.dprv
   val priv_s = priv(0)
   val priv_uses_vm = priv <= PRV.S
@@ -189,11 +264,15 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
                 Mux(vm_enabled && special_entry.nonEmpty, special_entry.map(e => e.ppn(vpn, e.getData(vpn))).getOrElse(0.U), io.req.bits.vaddr >> pgIdxBits))
   val mpu_physaddr = Cat(mpu_ppn, io.req.bits.vaddr(pgIdxBits-1, 0))
   val mpu_priv = Mux[UInt](Bool(usingVM) && (do_refill || io.req.bits.passthrough /* PTW */), PRV.S, Cat(io.ptw.status.debug, priv))
+
+  // PMP
   val pmp = Module(new PMPChecker(lgMaxSize))
   pmp.io.addr := mpu_physaddr
   pmp.io.size := io.req.bits.size
   pmp.io.pmp := (io.ptw.pmp: Seq[PMP])
   pmp.io.prv := mpu_priv
+
+  // PMA
   val legal_address = edge.manager.findSafe(mpu_physaddr).reduce(_||_)
   def fastCheck(member: TLManagerParameters => Boolean) =
     legal_address && edge.manager.fastProperty(mpu_physaddr, member, (b:Boolean) => Bool(b))
@@ -215,6 +294,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val hits = Cat(!vm_enabled, real_hits)
 
   // permission bit arrays
+  // Refill
   when (do_refill) {
     val pte = io.ptw.resp.bits.pte
     val newEntry = Wire(new TLBEntryData)
@@ -262,18 +342,28 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
 
   val nPhysicalEntries = 1 + special_entry.size
   val ptw_ae_array = Cat(false.B, entries.map(_.ae).asUInt)
+  // priv
   val priv_rw_ok = Mux(!priv_s || io.ptw.status.sum, entries.map(_.u).asUInt, 0.U) | Mux(priv_s, ~entries.map(_.u).asUInt, 0.U)
   val priv_x_ok = Mux(priv_s, ~entries.map(_.u).asUInt, entries.map(_.u).asUInt)
   val r_array = Cat(true.B, priv_rw_ok & (entries.map(_.sr).asUInt | Mux(io.ptw.status.mxr, entries.map(_.sx).asUInt, UInt(0))))
   val w_array = Cat(true.B, priv_rw_ok & entries.map(_.sw).asUInt)
   val x_array = Cat(true.B, priv_x_ok & entries.map(_.sx).asUInt)
+  // PMA
+  // read
   val pr_array = Cat(Fill(nPhysicalEntries, prot_r), normal_entries.map(_.pr).asUInt) & ~ptw_ae_array
+  // write
   val pw_array = Cat(Fill(nPhysicalEntries, prot_w), normal_entries.map(_.pw).asUInt) & ~ptw_ae_array
+  // execute
   val px_array = Cat(Fill(nPhysicalEntries, prot_x), normal_entries.map(_.px).asUInt) & ~ptw_ae_array
+  // put effect
   val eff_array = Cat(Fill(nPhysicalEntries, prot_eff), normal_entries.map(_.eff).asUInt)
+  // cacheable
   val c_array = Cat(Fill(nPhysicalEntries, cacheable), normal_entries.map(_.c).asUInt)
+  // put partial
   val ppp_array = Cat(Fill(nPhysicalEntries, prot_pp), normal_entries.map(_.ppp).asUInt)
+  // atomic arithmetic
   val paa_array = Cat(Fill(nPhysicalEntries, prot_aa), normal_entries.map(_.paa).asUInt)
+  // atomic logic
   val pal_array = Cat(Fill(nPhysicalEntries, prot_al), normal_entries.map(_.pal).asUInt)
   val ppp_array_if_cached = ppp_array | c_array
   val paa_array_if_cached = paa_array | Mux(usingAtomicsInCache, c_array, 0.U)
@@ -304,6 +394,8 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val ae_array =
     Mux(misaligned, eff_array, 0.U) |
     Mux(cmd_lrsc, ~lrscAllowed, 0.U)
+
+  // access exception needs SoC information from PMA.
   val ae_ld_array = Mux(cmd_read, ae_array | ~pr_array, 0.U)
   val ae_st_array =
     Mux(cmd_write_perms, ae_array | ~pw_array, 0.U) |
@@ -338,16 +430,21 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   // a miss on duplicate entries.
   val multipleHits = PopCountAtLeast(real_hits, 2)
 
+  // only pull up req.ready when this is s_ready state.
   io.req.ready := state === s_ready
+
   io.resp.pf.ld := (bad_va && cmd_read) || (pf_ld_array & hits).orR
   io.resp.pf.st := (bad_va && cmd_write_perms) || (pf_st_array & hits).orR
   io.resp.pf.inst := bad_va || (pf_inst_array & hits).orR
+
   io.resp.ae.ld := (ae_ld_array & hits).orR
   io.resp.ae.st := (ae_st_array & hits).orR
   io.resp.ae.inst := (~px_array & hits).orR
+
   io.resp.ma.ld := (ma_ld_array & hits).orR
   io.resp.ma.st := (ma_st_array & hits).orR
   io.resp.ma.inst := false // this is up to the pipeline to figure out
+
   io.resp.cacheable := (c_array & hits).orR
   io.resp.must_alloc := (must_alloc_array & hits).orR
   io.resp.prefetchable := (prefetchable_array & hits).orR && edge.manager.managers.forall(m => !m.supportsAcquireB || m.supportsHint)
@@ -360,6 +457,9 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
 
   if (usingVM) {
     val sfence = io.sfence.valid
+    // this is [[s_ready]]
+    // handle miss/hit at the first cycle.
+    // if miss, request next PTW(L2TLB).
     when (io.req.fire() && tlb_miss) {
       state := s_request
       r_refill_tag := vpn
@@ -369,18 +469,31 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
       r_sectored_hit_addr := OHToUInt(sector_hits)
       r_sectored_hit := sector_hits.orR
     }
+    // Handle SFENCE.VMA when send request to PTW.
+    // SFENCE.VMA    io.ptw.req.ready     kill
+    //       ?                 ?            1
+    //       0                 0            0
+    //       0                 1            0 -> s_wait
+    //       1                 0            0 -> s_wait_invalidate
+    //       1                 0            0 -> s_ready
     when (state === s_request) {
+      // SFENCE.VMA will kill TLB entries based on rs1 and rs2. It will take 1 cycle.
       when (sfence) { state := s_ready }
+      // here should be io.ptw.req.fire, but assert(io.ptw.req.ready === true.B)
+      // fire -> s_wait
       when (io.ptw.req.ready) { state := Mux(sfence, s_wait_invalidate, s_wait) }
+      // If CPU kills request(frontend.s2_redirect)
       when (io.kill) { state := s_ready }
     }
     when (state === s_wait && sfence) {
       state := s_wait_invalidate
     }
+    // after CPU acquire the responds, go back to s_ready.
     when (io.ptw.resp.valid) {
       state := s_ready
     }
 
+    // SFENCE processing logic.
     when (sfence) {
       assert(!io.sfence.bits.rs1 || (io.sfence.bits.addr >> pgIdxBits) === vpn)
       for (e <- all_real_entries) {
